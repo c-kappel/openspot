@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenSpot</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #map { height: 100%; width: 100%; background: #2b2b2b; }
+    .leaflet-control-attribution { display: none; }
+    .leaflet-control-zoom { display: none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const API = "http://localhost:8000/parking";
+    const POLL_MS = 2000;
+
+    const ZOOM = 17;
+    const map = L.map("map", {
+      center: [38.035550, -78.498763],
+      zoom: ZOOM,
+      minZoom: ZOOM,
+      maxZoom: ZOOM,
+      zoomControl: false,
+      scrollWheelZoom: false,
+      doubleClickZoom: false,
+      touchZoom: false,
+      keyboard: false,
+    });
+
+    // Dark tile layer with buildings + roads, no text labels
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png", {
+      maxZoom: 20,
+    }).addTo(map);
+
+    const FRAME_WIDTH = 640;
+    const GPS_ANCHOR_LEFT  = [38.035723, -78.498669];
+    const GPS_ANCHOR_RIGHT = [38.035377, -78.498858];
+    const SPOT_LAT_WIDTH = 0.00003;
+
+    function xToGps(x) {
+      const t = x / FRAME_WIDTH;
+      return [
+        GPS_ANCHOR_LEFT[0] + t * (GPS_ANCHOR_RIGHT[0] - GPS_ANCHOR_LEFT[0]),
+        GPS_ANCHOR_LEFT[1] + t * (GPS_ANCHOR_RIGHT[1] - GPS_ANCHOR_LEFT[1]),
+      ];
+    }
+
+    let layers = [];
+
+    function clearLayers() {
+      layers.forEach(l => map.removeLayer(l));
+      layers = [];
+    }
+
+    function drawSegments(data) {
+      clearLayers();
+      for (const [spotIdx, segs] of Object.entries(data)) {
+        for (const [[lat1, lon1], [lat2, lon2]] of segs) {
+          const bounds = [
+            [lat1 - SPOT_LAT_WIDTH, lon1],
+            [lat2 + SPOT_LAT_WIDTH, lon2],
+          ];
+          const rect = L.rectangle(bounds, {
+            color: "#00cc44",
+            weight: 2,
+            fillColor: "#00cc44",
+            fillOpacity: 0.3,
+            interactive: false,
+          }).addTo(map);
+          layers.push(rect);
+        }
+      }
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch(API);
+        if (!res.ok) return;
+        drawSegments(await res.json());
+      } catch (_) {}
+    }
+
+    poll();
+    setInterval(poll, POLL_MS);
+  </script>
+</body>
+</html>
