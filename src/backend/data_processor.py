@@ -6,10 +6,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import threading
+import time
+from pathlib import Path
 
-SPOT_2 = (40, 400, 2070, 640)
+# Night test footage:
+# SPOT_2 = (40, 400, 2070, 640)
+# SPOTS = [SPOT_2]
 
-SPOTS = [SPOT_2]
+# Original test footage:
+SPOT_1 = (10, 230, 180, 270)
+SPOT_2 = (340, 200, 570, 240)
+
+SPOTS = [SPOT_1, SPOT_2]
 
 # Anchor points mapping camera pixels to map.png pixels
 CAM_ANCHOR_1 = (10,  230)
@@ -59,7 +67,7 @@ threading.Thread(
     daemon=True,
 ).start()
 
-cap = cv.VideoCapture("/Users/christiankappel/Projects/openspot/footage/test3_1080p.mov")
+cap = cv.VideoCapture(Path(__file__).resolve().parent.parent.parent / "footage" / "test.mov")
 fps = cap.get(cv.CAP_PROP_FPS) or 30
 frame_delay = int(1000 / fps)
 
@@ -72,6 +80,24 @@ HISTORY_FRAMES     = 10
 MOVEMENT_THRESHOLD = 5
 SUSTAIN_FRAMES     = 5
 MIN_CONF           = 0.25
+BOX_EMA_ALPHA      = 0.25
+BOX_STALE_SECONDS  = 2.0
+STATE_DEBOUNCE_SECONDS = 2.0
+OPEN_OCCUPANCY_TOLERANCE_PX = 8
+
+smoothed_parked_boxes = {}
+parked_last_seen = {}
+spot_state = {}
+spot_pending_state = {}
+spot_pending_since = {}
+debounced_free_segments = {}
+
+
+def smooth_box(prev_box, new_box, alpha):
+    p = np.array(prev_box, dtype=np.float32)
+    n = np.array(new_box, dtype=np.float32)
+    s = alpha * n + (1.0 - alpha) * p
+    return tuple(float(v) for v in s)
 
 
 def get_free_segments(spots, parked_boxes):
@@ -108,6 +134,7 @@ while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
+    now = time.monotonic()
 
     results = model.track(
         frame,
@@ -120,6 +147,7 @@ while cap.isOpened():
 
     boxes_data = results[0].boxes
     free = {}
+    parked_detections = {}
 
     if boxes_data is not None and boxes_data.id is not None:
         xyxy  = boxes_data.xyxy.cpu().numpy()
@@ -218,9 +246,65 @@ while cap.isOpened():
             )
             if label == "parked_car":
                 parked_boxes.append((x1, y1, x2, y2))
+                parked_detections[car_id] = (x1, y1, x2, y2)
 
-        free = get_free_segments(SPOTS, parked_boxes)
-        latest_free_map = free_segments_to_map(SPOTS, free)
+    # Smooth parked boxes over time to reduce free-space jitter.
+    for car_id, box in parked_detections.items():
+        if car_id in smoothed_parked_boxes:
+            smoothed_parked_boxes[car_id] = smooth_box(
+                smoothed_parked_boxes[car_id],
+                box,
+                BOX_EMA_ALPHA,
+            )
+        else:
+            smoothed_parked_boxes[car_id] = tuple(float(v) for v in box)
+        parked_last_seen[car_id] = now
+
+    stale_ids = [
+        car_id for car_id, ts in parked_last_seen.items()
+        if now - ts > BOX_STALE_SECONDS
+    ]
+    for car_id in stale_ids:
+        parked_last_seen.pop(car_id, None)
+        smoothed_parked_boxes.pop(car_id, None)
+
+    parked_boxes = list(smoothed_parked_boxes.values())
+    raw_free = get_free_segments(SPOTS, parked_boxes)
+
+    # Debounce per-spot open/taken state so flips only happen after sustained evidence.
+    for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
+        raw_free_segs = raw_free.get(i, [(sx1, sx2)])
+        total_width = sx2 - sx1
+        free_width = sum((fx2 - fx1) for (fx1, fx2) in raw_free_segs)
+        occupied_width = max(0, total_width - free_width)
+        raw_is_open = occupied_width <= OPEN_OCCUPANCY_TOLERANCE_PX
+
+        if i not in spot_state:
+            spot_state[i] = raw_is_open
+            debounced_free_segments[i] = raw_free_segs
+            continue
+
+        committed_state = spot_state[i]
+        if raw_is_open == committed_state:
+            spot_pending_state.pop(i, None)
+            spot_pending_since.pop(i, None)
+            debounced_free_segments[i] = raw_free_segs
+            continue
+
+        if spot_pending_state.get(i) != raw_is_open:
+            spot_pending_state[i] = raw_is_open
+            spot_pending_since[i] = now
+            continue
+
+        if now - spot_pending_since[i] >= STATE_DEBOUNCE_SECONDS:
+            spot_state[i] = raw_is_open
+            spot_pending_state.pop(i, None)
+            spot_pending_since.pop(i, None)
+            debounced_free_segments[i] = raw_free_segs
+
+    free = {i: debounced_free_segments.get(i, raw_free.get(i, [(sx1, sx2)]))
+            for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS)}
+    latest_free_map = free_segments_to_map(SPOTS, free)
 
     # --- Draw spot borders: green where free, red where occupied ---
     def rotated_rect(x1, y1, x2, y2, angle_deg):
@@ -235,7 +319,7 @@ while cap.isOpened():
         ], dtype=np.int32)
         return rotated.reshape((-1, 1, 2))
 
-    SPOT_ANGLES = [-5]  # per-spot angles
+    SPOT_ANGLES = [-3, -3]  # per-spot angles
 
     for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
         SPOT_ANGLE = SPOT_ANGLES[i]
