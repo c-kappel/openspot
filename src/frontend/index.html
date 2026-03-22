@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body, #map { height: 100%; width: 100%; background: #2b2b2b; }
+    html, body, #map { height: 100%; width: 100%; background: #444444; }
     .leaflet-control-attribution { display: none; }
     .leaflet-control-zoom { display: none; }
   </style>
@@ -20,35 +20,28 @@
     const API = "http://localhost:8000/parking";
     const POLL_MS = 2000;
 
-    const ZOOM = 17;
+    const IMG_W = 3420;
+    const IMG_H = 1974;
+
     const map = L.map("map", {
-      center: [38.035550, -78.498763],
-      zoom: ZOOM,
-      minZoom: ZOOM,
-      maxZoom: ZOOM,
+      crs: L.CRS.Simple,
       zoomControl: false,
       scrollWheelZoom: false,
       doubleClickZoom: false,
       touchZoom: false,
+      dragging: false,
       keyboard: false,
+      minZoom: -4,
     });
 
-    // Dark tile layer with buildings + roads, no text labels
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png", {
-      maxZoom: 20,
-    }).addTo(map);
+    // In L.CRS.Simple, [lat, lng] = [y_from_bottom, x_from_left]
+    // Image y goes top-down, so we flip: leaflet_y = IMG_H - image_y
+    const imgBounds = [[0, 0], [IMG_H, IMG_W]];
+    L.imageOverlay("map.png", imgBounds).addTo(map);
+    map.fitBounds(imgBounds);
 
-    const FRAME_WIDTH = 640;
-    const GPS_ANCHOR_LEFT  = [38.035723, -78.498669];
-    const GPS_ANCHOR_RIGHT = [38.035377, -78.498858];
-    const SPOT_LAT_WIDTH = 0.00003;
-
-    function xToGps(x) {
-      const t = x / FRAME_WIDTH;
-      return [
-        GPS_ANCHOR_LEFT[0] + t * (GPS_ANCHOR_RIGHT[0] - GPS_ANCHOR_LEFT[0]),
-        GPS_ANCHOR_LEFT[1] + t * (GPS_ANCHOR_RIGHT[1] - GPS_ANCHOR_LEFT[1]),
-      ];
+    function toLeaflet(mx, my) {
+      return [IMG_H - my, mx];
     }
 
     let layers = [];
@@ -58,22 +51,53 @@
       layers = [];
     }
 
+    const DISPLAY_PADDING = 15;
+    const SEGMENT_SCALE = 20; // multiplier for segment width so changes are visible
+    const ROTATION_DEG = -15;
+    const OFFSET_X = 140;
+    const OFFSET_Y = -250;
+    // Per-spot additional offsets [x, y] indexed by spot key
+    const SPOT_OFFSETS = { "0": [10, 110], "1": [55, 25] };
+
+    function rotatePoint(cx, cy, px, py, deg) {
+      const rad = deg * Math.PI / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      return [
+        cx + cos * (px - cx) - sin * (py - cy),
+        cy + sin * (px - cx) + cos * (py - cy),
+      ];
+    }
+
     function drawSegments(data) {
       clearLayers();
-      for (const [spotIdx, segs] of Object.entries(data)) {
-        for (const [[lat1, lon1], [lat2, lon2]] of segs) {
-          const bounds = [
-            [lat1 - SPOT_LAT_WIDTH, lon1],
-            [lat2 + SPOT_LAT_WIDTH, lon2],
-          ];
-          const rect = L.rectangle(bounds, {
+      for (const [spotKey, segs] of Object.entries(data)) {
+        const [sx, sy] = SPOT_OFFSETS[spotKey] || [0, 0];
+        for (const { topLeft, bottomRight } of segs) {
+          const segW = (bottomRight[0] - topLeft[0]) * SEGMENT_SCALE;
+          const segH = (bottomRight[1] - topLeft[1]) * SEGMENT_SCALE;
+          const midX = (topLeft[0] + bottomRight[0]) / 2 + OFFSET_X + sx;
+          const midY = (topLeft[1] + bottomRight[1]) / 2 + OFFSET_Y + sy;
+          const x1 = midX - segW / 2 - DISPLAY_PADDING;
+          const y1 = midY - segH / 2 - DISPLAY_PADDING;
+          const x2 = midX + segW / 2 + DISPLAY_PADDING;
+          const y2 = midY + segH / 2 + DISPLAY_PADDING;
+          const cx = (x1 + x2) / 2;
+          const cy = (y1 + y2) / 2;
+
+          const corners = [[x1,y1],[x2,y1],[x2,y2],[x1,y2]].map(([px, py]) => {
+            const [rx, ry] = rotatePoint(cx, cy, px, py, ROTATION_DEG);
+            return toLeaflet(rx, ry);
+          });
+
+          const poly = L.polygon(corners, {
             color: "#00cc44",
-            weight: 2,
+            weight: 3,
             fillColor: "#00cc44",
-            fillOpacity: 0.3,
+            fillOpacity: 0.4,
             interactive: false,
           }).addTo(map);
-          layers.push(rect);
+          layers.push(poly);
         }
       }
     }

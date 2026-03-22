@@ -3,57 +3,63 @@ import numpy as np
 from ultralytics import YOLO
 from collections import defaultdict
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import threading
 
-SPOT_1 = (10, 230, 180, 270)
-SPOT_2 = (340, 200, 570, 240)
+SPOT_2 = (40, 400, 2070, 640)
 
-SPOTS = [SPOT_1, SPOT_2]
+SPOTS = [SPOT_2]
 
-# GPS anchor points — fill in with real values
-# Pixel x=0 maps to GPS_ANCHOR_LEFT, pixel x=FRAME_WIDTH maps to GPS_ANCHOR_RIGHT
-FRAME_WIDTH    = 640
-GPS_ANCHOR_LEFT  = (38.035723, -78.498669)  # (lat, lon) at x=0
-GPS_ANCHOR_RIGHT = (38.035377, -78.498858)  # (lat, lon) at x=FRAME_WIDTH
-
-
-def x_to_gps(x_pixel):
-    t = x_pixel / FRAME_WIDTH
-    lat = GPS_ANCHOR_LEFT[0] + t * (GPS_ANCHOR_RIGHT[0] - GPS_ANCHOR_LEFT[0])
-    lon = GPS_ANCHOR_LEFT[1] + t * (GPS_ANCHOR_RIGHT[1] - GPS_ANCHOR_LEFT[1])
-    return (lat, lon)
+# Anchor points mapping camera pixels to map.png pixels
+CAM_ANCHOR_1 = (10,  230)
+CAM_ANCHOR_2 = (570, 240)
+MAP_ANCHOR_1 = (1000, 1300)
+MAP_ANCHOR_2 = (1010, 1320)
 
 
-def free_segments_to_gps(free_segments):
+def cam_to_map(cam_x, cam_y):
+    tx = (cam_x - CAM_ANCHOR_1[0]) / (CAM_ANCHOR_2[0] - CAM_ANCHOR_1[0])
+    ty = (cam_y - CAM_ANCHOR_1[1]) / (CAM_ANCHOR_2[1] - CAM_ANCHOR_1[1])
+    mx = MAP_ANCHOR_1[0] + tx * (MAP_ANCHOR_2[0] - MAP_ANCHOR_1[0])
+    my = MAP_ANCHOR_1[1] + ty * (MAP_ANCHOR_2[1] - MAP_ANCHOR_1[1])
+    return (mx, my)
+
+
+def free_segments_to_map(spots, free_segments):
     """
-    Converts free x-pixel segments to GPS coordinate ranges.
-
-    Args:
-        free_segments: dict from get_free_segments —
-                       spot_index -> list of (x1, x2) pixel ranges
+    Converts free camera pixel segments to map.png pixel rectangles.
 
     Returns:
-        dict: spot_index -> list of ((lat1, lon1), (lat2, lon2)) GPS ranges
+        dict: spot_index -> list of {"topLeft": [mx, my], "bottomRight": [mx, my]}
     """
-    return {
-        spot_i: [(x_to_gps(x1), x_to_gps(x2)) for (x1, x2) in segs]
-        for spot_i, segs in free_segments.items()
-    }
+    result = {}
+    for spot_i, segs in free_segments.items():
+        sx1, sy1, sx2, sy2 = spots[spot_i]
+        result[spot_i] = [
+            {"topLeft": cam_to_map(x1, sy1), "bottomRight": cam_to_map(x2, sy2)}
+            for (x1, x2) in segs
+        ]
+    return result
 
 app = FastAPI()
-latest_free_gps = {}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+)
+latest_free_map = {}
 
 @app.get("/parking")
 def get_parking():
-    return latest_free_gps
+    return latest_free_map
 
 threading.Thread(
     target=lambda: uvicorn.run(app, host="0.0.0.0", port=8000),
     daemon=True,
 ).start()
 
-cap = cv.VideoCapture("/Users/christiankappel/Projects/openspot/footage/test.mov")
+cap = cv.VideoCapture("/Users/christiankappel/Projects/openspot/footage/test3_1080p.mov")
 fps = cap.get(cv.CAP_PROP_FPS) or 30
 frame_delay = int(1000 / fps)
 
@@ -65,7 +71,7 @@ moving_streak    = defaultdict(int)
 HISTORY_FRAMES     = 10
 MOVEMENT_THRESHOLD = 5
 SUSTAIN_FRAMES     = 5
-MIN_CONF           = 0.45
+MIN_CONF           = 0.25
 
 
 def get_free_segments(spots, parked_boxes):
@@ -102,6 +108,7 @@ while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
+
     results = model.track(
         frame,
         persist=True,
@@ -213,14 +220,29 @@ while cap.isOpened():
                 parked_boxes.append((x1, y1, x2, y2))
 
         free = get_free_segments(SPOTS, parked_boxes)
-        latest_free_gps = free_segments_to_gps(free)
+        latest_free_map = free_segments_to_map(SPOTS, free)
 
     # --- Draw spot borders: green where free, red where occupied ---
+    def rotated_rect(x1, y1, x2, y2, angle_deg):
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        angle = np.radians(angle_deg)
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        rotated = np.array([
+            [cx + cos_a * (px - cx) - sin_a * (py - cy),
+             cy + sin_a * (px - cx) + cos_a * (py - cy)]
+            for px, py in corners
+        ], dtype=np.int32)
+        return rotated.reshape((-1, 1, 2))
+
+    SPOT_ANGLES = [-5]  # per-spot angles
+
     for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
+        SPOT_ANGLE = SPOT_ANGLES[i]
         free_segs = free.get(i, [(sx1, sx2)])
         for (fx1, fx2) in free_segs:
-            cv.rectangle(frame, (fx1, sy1), (fx2, sy2), (0, 255, 0), 2)
-        # occupied = full spot minus free segments
+            pts = rotated_rect(fx1, sy1, fx2, sy2, SPOT_ANGLE)
+            cv.polylines(frame, [pts], True, (0, 255, 0), 2)
         occ_segs = [(sx1, sx2)]
         for (fx1, fx2) in free_segs:
             remaining = []
@@ -234,7 +256,8 @@ while cap.isOpened():
                         remaining.append((fx2, ox2))
             occ_segs = remaining
         for (ox1, ox2) in occ_segs:
-            cv.rectangle(frame, (ox1, sy1), (ox2, sy2), (0, 0, 255), 2)
+            pts = rotated_rect(ox1, sy1, ox2, sy2, SPOT_ANGLE)
+            cv.polylines(frame, [pts], True, (0, 0, 255), 2)
 
     cv.imshow("Parking", frame)
     if cv.waitKey(frame_delay) & 0xFF == ord('q'):
