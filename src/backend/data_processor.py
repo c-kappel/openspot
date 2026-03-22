@@ -240,9 +240,6 @@ while cap.isOpened():
     for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
         SPOT_ANGLE = SPOT_ANGLES[i]
         free_segs = free.get(i, [(sx1, sx2)])
-        for (fx1, fx2) in free_segs:
-            pts = rotated_rect(fx1, sy1, fx2, sy2, SPOT_ANGLE)
-            cv.polylines(frame, [pts], True, (0, 255, 0), 2)
         occ_segs = [(sx1, sx2)]
         for (fx1, fx2) in free_segs:
             remaining = []
@@ -255,9 +252,15 @@ while cap.isOpened():
                     if fx2 < ox2:
                         remaining.append((fx2, ox2))
             occ_segs = remaining
-        for (ox1, ox2) in occ_segs:
-            pts = rotated_rect(ox1, sy1, ox2, sy2, SPOT_ANGLE)
-            cv.polylines(frame, [pts], True, (0, 0, 255), 2)
+
+        # Only draw if a car is occupying part of the spot
+        if occ_segs:
+            for (fx1, fx2) in free_segs:
+                pts = rotated_rect(fx1, sy1, fx2, sy2, SPOT_ANGLE)
+                cv.polylines(frame, [pts], True, (0, 255, 0), 2)
+            for (ox1, ox2) in occ_segs:
+                pts = rotated_rect(ox1, sy1, ox2, sy2, SPOT_ANGLE)
+                cv.polylines(frame, [pts], True, (0, 0, 255), 2)
 
     cv.imshow("Parking", frame)
     if cv.waitKey(frame_delay) & 0xFF == ord('q'):
