@@ -84,6 +84,7 @@ BOX_EMA_ALPHA      = 0.25
 BOX_STALE_SECONDS  = 2.0
 STATE_DEBOUNCE_SECONDS = 2.0
 OPEN_OCCUPANCY_TOLERANCE_PX = 8
+INITIAL_NO_DEBOUNCE_SECONDS = 2.0
 
 smoothed_parked_boxes = {}
 parked_last_seen = {}
@@ -91,6 +92,21 @@ spot_state = {}
 spot_pending_state = {}
 spot_pending_since = {}
 debounced_free_segments = {}
+debounce_started_at = None
+
+DISPLAY_TOGGLES = {
+    "show_open_parking": True,
+    "show_blocked_parking": True,
+    "show_parked_cars": True,
+    "show_moving_cars": True,
+}
+TOGGLE_ITEMS = [
+    ("Open parking", "show_open_parking"),
+    ("Blocked parking", "show_blocked_parking"),
+    ("Parked cars", "show_parked_cars"),
+    ("Moving cars", "show_moving_cars"),
+]
+TOGGLE_HITBOXES = {}
 
 
 def smooth_box(prev_box, new_box, alpha):
@@ -130,11 +146,77 @@ def get_free_segments(spots, parked_boxes):
         result[i] = free
     return result
 
+
+def draw_control_panel(frame):
+    panel_x, panel_y = 20, 20
+    row_h = 22
+    panel_w = 190
+    panel_h = 14 + row_h * len(TOGGLE_ITEMS) + 8
+    overlay = frame.copy()
+    cv.rectangle(
+        overlay,
+        (panel_x, panel_y),
+        (panel_x + panel_w, panel_y + panel_h),
+        (35, 35, 35),
+        -1,
+    )
+    cv.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv.rectangle(
+        frame,
+        (panel_x, panel_y),
+        (panel_x + panel_w, panel_y + panel_h),
+        (180, 180, 180),
+        1,
+    )
+    cv.putText(
+        frame,
+        "Display controls",
+        (panel_x + 8, panel_y + 14),
+        cv.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (240, 240, 240),
+        1,
+    )
+
+    TOGGLE_HITBOXES.clear()
+    for idx, (label, key) in enumerate(TOGGLE_ITEMS):
+        y = panel_y + 24 + idx * row_h
+        box = (panel_x + 8, y - 10, panel_x + 20, y + 2)
+        TOGGLE_HITBOXES[key] = box
+        x1, y1, x2, y2 = box
+        cv.rectangle(frame, (x1, y1), (x2, y2), (220, 220, 220), 1)
+        if DISPLAY_TOGGLES[key]:
+            cv.rectangle(frame, (x1 + 3, y1 + 3), (x2 - 3, y2 - 3), (0, 220, 120), -1)
+        cv.putText(
+            frame,
+            label,
+            (panel_x + 26, y),
+            cv.FONT_HERSHEY_SIMPLEX,
+            0.44,
+            (240, 240, 240),
+            1,
+        )
+
+
+def handle_mouse(event, x, y, flags, param):
+    if event != cv.EVENT_LBUTTONDOWN:
+        return
+    for key, (x1, y1, x2, y2) in TOGGLE_HITBOXES.items():
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            DISPLAY_TOGGLES[key] = not DISPLAY_TOGGLES[key]
+            break
+
+
+cv.namedWindow("Parking")
+cv.setMouseCallback("Parking", handle_mouse)
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
     now = time.monotonic()
+    if debounce_started_at is None:
+        debounce_started_at = now
 
     results = model.track(
         frame,
@@ -234,16 +316,21 @@ while cap.isOpened():
         for box, car_id, label in zip(xyxy_d, ids_d, labels_d):
             x1, y1, x2, y2 = box
             color = (0, 255, 255) if label == "moving_car" else (0, 0, 255)
-            cv.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            cv.putText(
-                frame,
-                f"{label} #{car_id}",
-                (int(x1), int(y1) - 8),
-                cv.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
+            should_draw = (
+                (label == "moving_car" and DISPLAY_TOGGLES["show_moving_cars"]) or
+                (label == "parked_car" and DISPLAY_TOGGLES["show_parked_cars"])
             )
+            if should_draw:
+                cv.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv.putText(
+                    frame,
+                    f"{label} #{car_id}",
+                    (int(x1), int(y1) - 8),
+                    cv.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2,
+                )
             if label == "parked_car":
                 parked_boxes.append((x1, y1, x2, y2))
                 parked_detections[car_id] = (x1, y1, x2, y2)
@@ -271,36 +358,47 @@ while cap.isOpened():
     parked_boxes = list(smoothed_parked_boxes.values())
     raw_free = get_free_segments(SPOTS, parked_boxes)
 
-    # Debounce per-spot open/taken state so flips only happen after sustained evidence.
-    for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
-        raw_free_segs = raw_free.get(i, [(sx1, sx2)])
-        total_width = sx2 - sx1
-        free_width = sum((fx2 - fx1) for (fx1, fx2) in raw_free_segs)
-        occupied_width = max(0, total_width - free_width)
-        raw_is_open = occupied_width <= OPEN_OCCUPANCY_TOLERANCE_PX
-
-        if i not in spot_state:
+    # Startup warmup: publish raw estimate immediately (no debounce delay).
+    if now - debounce_started_at < INITIAL_NO_DEBOUNCE_SECONDS:
+        for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
+            raw_free_segs = raw_free.get(i, [(sx1, sx2)])
+            total_width = sx2 - sx1
+            free_width = sum((fx2 - fx1) for (fx1, fx2) in raw_free_segs)
+            occupied_width = max(0, total_width - free_width)
+            raw_is_open = occupied_width <= OPEN_OCCUPANCY_TOLERANCE_PX
             spot_state[i] = raw_is_open
             debounced_free_segments[i] = raw_free_segs
-            continue
+    else:
+        # Debounce per-spot open/taken state so flips only happen after sustained evidence.
+        for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
+            raw_free_segs = raw_free.get(i, [(sx1, sx2)])
+            total_width = sx2 - sx1
+            free_width = sum((fx2 - fx1) for (fx1, fx2) in raw_free_segs)
+            occupied_width = max(0, total_width - free_width)
+            raw_is_open = occupied_width <= OPEN_OCCUPANCY_TOLERANCE_PX
 
-        committed_state = spot_state[i]
-        if raw_is_open == committed_state:
-            spot_pending_state.pop(i, None)
-            spot_pending_since.pop(i, None)
-            debounced_free_segments[i] = raw_free_segs
-            continue
+            if i not in spot_state:
+                spot_state[i] = raw_is_open
+                debounced_free_segments[i] = raw_free_segs
+                continue
 
-        if spot_pending_state.get(i) != raw_is_open:
-            spot_pending_state[i] = raw_is_open
-            spot_pending_since[i] = now
-            continue
+            committed_state = spot_state[i]
+            if raw_is_open == committed_state:
+                spot_pending_state.pop(i, None)
+                spot_pending_since.pop(i, None)
+                debounced_free_segments[i] = raw_free_segs
+                continue
 
-        if now - spot_pending_since[i] >= STATE_DEBOUNCE_SECONDS:
-            spot_state[i] = raw_is_open
-            spot_pending_state.pop(i, None)
-            spot_pending_since.pop(i, None)
-            debounced_free_segments[i] = raw_free_segs
+            if spot_pending_state.get(i) != raw_is_open:
+                spot_pending_state[i] = raw_is_open
+                spot_pending_since[i] = now
+                continue
+
+            if now - spot_pending_since[i] >= STATE_DEBOUNCE_SECONDS:
+                spot_state[i] = raw_is_open
+                spot_pending_state.pop(i, None)
+                spot_pending_since.pop(i, None)
+                debounced_free_segments[i] = raw_free_segs
 
     free = {i: debounced_free_segments.get(i, raw_free.get(i, [(sx1, sx2)]))
             for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS)}
@@ -339,12 +437,16 @@ while cap.isOpened():
 
         # Only draw if a car is occupying part of the spot
         if occ_segs:
-            for (fx1, fx2) in free_segs:
-                pts = rotated_rect(fx1, sy1, fx2, sy2, SPOT_ANGLE)
-                cv.polylines(frame, [pts], True, (0, 255, 0), 2)
-            for (ox1, ox2) in occ_segs:
-                pts = rotated_rect(ox1, sy1, ox2, sy2, SPOT_ANGLE)
-                cv.polylines(frame, [pts], True, (0, 0, 255), 2)
+            if DISPLAY_TOGGLES["show_open_parking"]:
+                for (fx1, fx2) in free_segs:
+                    pts = rotated_rect(fx1, sy1, fx2, sy2, SPOT_ANGLE)
+                    cv.polylines(frame, [pts], True, (0, 255, 0), 2)
+            if DISPLAY_TOGGLES["show_blocked_parking"]:
+                for (ox1, ox2) in occ_segs:
+                    pts = rotated_rect(ox1, sy1, ox2, sy2, SPOT_ANGLE)
+                    cv.polylines(frame, [pts], True, (0, 0, 255), 2)
+
+    draw_control_panel(frame)
 
     cv.imshow("Parking", frame)
     if cv.waitKey(frame_delay) & 0xFF == ord('q'):
