@@ -10,14 +10,16 @@ import time
 from pathlib import Path
 
 # Night test footage:
-# SPOT_2 = (40, 400, 2070, 640)
-# SPOTS = [SPOT_2]
+SPOT_2 = (40, 400, 2070, 640)
+SPOTS = [SPOT_2]
+SPOT_ANGLES = [-5]  # per-spot angles
+
 
 # Original test footage:
-SPOT_1 = (10, 230, 180, 270)
-SPOT_2 = (340, 200, 570, 240)
-
-SPOTS = [SPOT_1, SPOT_2]
+# SPOT_1 = (10, 230, 180, 270)
+# SPOT_2 = (340, 200, 570, 240)
+# SPOT_ANGLES = [-3, -3]  # per-spot angles
+# SPOTS = [SPOT_1, SPOT_2]
 
 # Anchor points mapping camera pixels to map.png pixels
 CAM_ANCHOR_1 = (10,  230)
@@ -67,7 +69,7 @@ threading.Thread(
     daemon=True,
 ).start()
 
-cap = cv.VideoCapture(Path(__file__).resolve().parent.parent.parent / "footage" / "test.mov")
+cap = cv.VideoCapture(Path(__file__).resolve().parent.parent.parent / "footage" / "test3.mov")
 fps = cap.get(cv.CAP_PROP_FPS) or 30
 frame_delay = int(1000 / fps)
 
@@ -81,7 +83,7 @@ MOVEMENT_THRESHOLD = 5
 SUSTAIN_FRAMES     = 5
 MIN_CONF           = 0.25
 BOX_EMA_ALPHA      = 0.25
-BOX_STALE_SECONDS  = 2.0
+BOX_STALE_SECONDS  = 4.0
 STATE_DEBOUNCE_SECONDS = 2.0
 OPEN_OCCUPANCY_TOLERANCE_PX = 8
 INITIAL_NO_DEBOUNCE_SECONDS = 2.0
@@ -180,7 +182,7 @@ def draw_control_panel(frame):
 
     TOGGLE_HITBOXES.clear()
     for idx, (label, key) in enumerate(TOGGLE_ITEMS):
-        y = panel_y + 24 + idx * row_h
+        y = panel_y + 32 + idx * row_h
         box = (panel_x + 8, y - 10, panel_x + 20, y + 2)
         TOGGLE_HITBOXES[key] = box
         x1, y1, x2, y2 = box
@@ -416,8 +418,6 @@ while cap.isOpened():
             for px, py in corners
         ], dtype=np.int32)
         return rotated.reshape((-1, 1, 2))
-
-    SPOT_ANGLES = [-3, -3]  # per-spot angles
 
     for i, (sx1, sy1, sx2, sy2) in enumerate(SPOTS):
         SPOT_ANGLE = SPOT_ANGLES[i]
